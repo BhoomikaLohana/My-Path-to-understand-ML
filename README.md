@@ -1,5 +1,6 @@
 # My-Path-to-understand-ML
-Blog Code Repository
+ 
+ # Blog Code Repository
 This repository contains all the Python scripts associated with my blogs. Each script is designed to complement the topics discussed in the blog posts, providing practical examples and implementations for better understanding.
 
 # Repository Structure:
