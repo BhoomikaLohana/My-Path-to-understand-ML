@@ -7,13 +7,13 @@ from tqdm import tqdm
 import torch.nn.functional as F
 from transformers import CLIPProcessor, CLIPModel
 
-# === Setup ===
+#  Setup 
 device = "cpu"
 model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
 processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
 model.to(device)
 
-# === Step 1: Text Embedding ===
+# Step 1: Text Embedding 
 texts = [
     "a peaceful place to be alone",
     "a crowded and noisy street",
