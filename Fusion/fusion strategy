@@ -1,0 +1,170 @@
+import os
+import torch
+from PIL import Image
+from transformers import CLIPProcessor, CLIPModel
+import torch.nn.functional as F
+from torch.nn.functional import cosine_similarity
+
+# === Setup ===
+device = "cuda" if torch.cuda.is_available() else "cpu"
+model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(device)
+processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+
+
+products = [
+    {
+        "title": "Nike Air Zoom Pegasus",
+        "description": "Lightweight running shoes with breathable mesh and responsive cushioning for daily runs.",
+        "image_path": "images/Nike Air Zoom Pegasus shoes.jpg"
+    },
+    {
+        "title": "Adidas Ultraboost 22",
+        "description": "High-performance sneakers with energy-returning Boost midsole and snug Primeknit upper.",
+        "image_path": "images/Adidas Ultraboost 22.jpg"
+    },
+    {
+        "title": "Allbirds Tree Dashers",
+        "description": "Sustainable shoes made from eucalyptus fiber, designed for comfort and eco-conscious running.",
+        "image_path": "images/Allbirds Tree Dashers.jpg"
+    },
+    {
+        "title": "ASICS Gel-Kayano 29",
+        "description": "Stability running shoes with gel cushioning and engineered mesh for structured support.",
+        "image_path": "images/ASICS Gel-Kayano 29.jpg"
+    },
+    {
+        "title": "Reebok Floatride Energy 4",
+        "description": "Budget-friendly running shoes with responsive cushioning and lightweight feel.",
+        "image_path": "images/Reebok Floatride Energy 4.jpg"
+    }
+]
+
+# === Embedding Generation ===
+for product in products:
+    # Title
+    title_input = processor(text=[product["title"]], return_tensors="pt", padding=True).to(device)
+    with torch.no_grad():
+        title_emb = model.get_text_features(**title_input)
+        title_emb = F.normalize(title_emb, p=2, dim=1).squeeze(0)
+
+    # Description
+    desc_input = processor(text=[product["description"]], return_tensors="pt", padding=True).to(device)
+    with torch.no_grad():
+        desc_emb = model.get_text_features(**desc_input)
+        desc_emb = F.normalize(desc_emb, p=2, dim=1).squeeze(0)
+
+    # Image
+    image = Image.open(product["image_path"]).convert("RGB")
+    image_input = processor(images=image, return_tensors="pt").to(device)
+    with torch.no_grad():
+        image_emb = model.get_image_features(**image_input)
+        image_emb = F.normalize(image_emb, p=2, dim=1).squeeze(0)
+
+    product["title_emb"] = title_emb
+    product["desc_emb"] = desc_emb
+    product["image_emb"] = image_emb
+
+# === Confirm Shapes ===
+print("Title embedding shape:", products[0]["title_emb"].shape)
+print("Description embedding shape:", products[0]["desc_emb"].shape)
+print("Image embedding shape:", products[0]["image_emb"].shape)
+
+# === Step 3: Fusion Methods ===
+
+# 1. Simple Average
+for product in products:
+    product["fused_avg"] = (
+        product["title_emb"] + product["desc_emb"] + product["image_emb"]
+    ) / 3
+
+# 2. Fixed Weighted
+w_title = 0.5
+w_desc = 0.3
+w_image = 0.2
+for product in products:
+    product["fused_weighted"] = (
+        w_title * product["title_emb"] +
+        w_desc  * product["desc_emb"] +
+        w_image * product["image_emb"]
+    )
+
+# 3. Hybrid Global-Local Fusion (Step 4)
+
+# Compute global weights
+def compute_global_weight(products, key):
+    embeddings = torch.stack([p[key] for p in products])
+    sims = cosine_similarity(embeddings.unsqueeze(1), embeddings.unsqueeze(0), dim=2)
+    avg_sim = sims.mean(dim=1)
+    return avg_sim.mean().item()
+
+G_title = compute_global_weight(products, "title_emb")
+G_desc  = compute_global_weight(products, "desc_emb")
+G_image = compute_global_weight(products, "image_emb")
+total = G_title + G_desc + G_image
+G_title /= total
+G_desc  /= total
+G_image /= total
+
+print(f"\nGlobal Weights:\nTitle: {G_title:.3f}, Desc: {G_desc:.3f}, Image: {G_image:.3f}")
+
+# === Step 5: Evaluate with 5 Queries ===
+queries = [
+    "eco-friendly running shoes made of eucalyptus fiber",
+    "lightweight shoes for daily road running",
+    "high-performance sneakers with energy return",
+    "budget-friendly shoes with comfort and support",
+    "shoes for stability and structured foot support"
+]
+
+def evaluate_query(query_text):
+    inputs = processor(text=[query_text], return_tensors="pt", padding=True).to(device)
+    with torch.no_grad():
+        query_emb = model.get_text_features(**inputs)
+        query_emb = F.normalize(query_emb, p=2, dim=1).squeeze(0)
+
+    # Hybrid Fusion with query-specific local weights
+    for product in products:
+        L_title = cosine_similarity(query_emb, product["title_emb"], dim=0).item()
+        L_desc  = cosine_similarity(query_emb, product["desc_emb"], dim=0).item()
+        L_image = cosine_similarity(query_emb, product["image_emb"], dim=0).item()
+
+        L_total = L_title + L_desc + L_image
+        L_title /= L_total
+        L_desc  /= L_total
+        L_image /= L_total
+
+        w_title = G_title * L_title
+        w_desc  = G_desc  * L_desc
+        w_image = G_image * L_image
+
+        w_sum = w_title + w_desc + w_image
+        w_title /= w_sum
+        w_desc  /= w_sum
+        w_image /= w_sum
+
+        product["fused_hybrid"] = (
+            w_title * product["title_emb"] +
+            w_desc  * product["desc_emb"] +
+            w_image * product["image_emb"]
+        )
+
+    def get_top_match(fusion_key):
+        scores = []
+        for product in products:
+            sim = cosine_similarity(query_emb, product[fusion_key], dim=0)
+            scores.append(sim.item())
+        top_idx = torch.tensor(scores).argmax().item()
+        return products[top_idx]["title"], scores[top_idx]
+
+    avg_title, avg_score = get_top_match("fused_avg")
+    weighted_title, weighted_score = get_top_match("fused_weighted")
+    hybrid_title, hybrid_score = get_top_match("fused_hybrid")
+
+    print(f"\nQuery: \"{query_text}\"")
+    print(f"  Avg Fusion:      {avg_title} (Score: {avg_score:.4f})")
+    print(f"  Weighted Fusion: {weighted_title} (Score: {weighted_score:.4f})")
+    print(f"  Hybrid Fusion:   {hybrid_title} (Score: {hybrid_score:.4f})")
+
+print("\n\n=== Running All Queries ===")
+for q in queries:
+    evaluate_query(q)
