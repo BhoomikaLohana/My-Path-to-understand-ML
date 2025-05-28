@@ -1,0 +1,21 @@
+Phase 1: Basic Retrieval
+1.  Who founded Harvard and when?
+2.	Where is Harvard located?
+3.	What is Harvard's endowment value?
+4.	How many U.S. presidents graduated from Harvard?
+5.	What is Harvard Yard?
+
+Phase 2: Intermediate Multi-Hop
+6.	how many are campuses of Harvard and what does each focus on?
+7.	Which schools and faculties are part of Harvard?
+8.	What types of achievements are Harvard alumni known for?
+9.	What buildings are on the main campus?
+10.	What role did Harvard play during the Great Depression and World War II?
+
+Phase 3: Advanced Graph-Based Inference
+11.	Why is Harvard considered one of the most prestigious universities in the world?
+12.	What kind of students live in Harvard's residential houses?
+13.	Which campus of Harvard is focused on health sciences and hospitals?
+14.	How has Harvard's mission evolved over the centuries?
+15.	How is Harvard represented in literature and film?
+16.	What kind of innovation ecosystem is being developed in Allston?
