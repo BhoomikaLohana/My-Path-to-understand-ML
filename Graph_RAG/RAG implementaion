@@ -1,0 +1,177 @@
+# === Step 1: Imports & Configuration ===
+from dotenv import load_dotenv
+import os
+import spacy
+from langchain_community.graphs import Neo4jGraph
+from langchain_community.vectorstores import Neo4jVector
+from langchain_openai import OpenAIEmbeddings, ChatOpenAI
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.chains import RetrievalQAWithSourcesChain
+
+# Load credentials
+load_dotenv()
+NEO4J_URI = os.getenv("NEO4J_URI")
+NEO4J_USERNAME = os.getenv("NEO4J_USERNAME")
+NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+# === Step 2: Load and Chunk Text ===
+with open("harvard.txt", "r", encoding="utf-8") as f:
+    raw_text = f.read()
+
+splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
+chunks = splitter.split_text(raw_text)
+
+chunk_nodes = [
+    {
+        "text": chunk,
+        "chunkId": f"harvard-chunk-{i:04d}",
+        "source": "harvard.txt",
+        "section": "main"
+    }
+    for i, chunk in enumerate(chunks)
+]
+print(f"Loaded {len(chunk_nodes)} chunks.")
+
+# === Step 3: Upload Chunks to Neo4j ===
+kg = Neo4jGraph(url=NEO4J_URI, username=NEO4J_USERNAME, password=NEO4J_PASSWORD)
+
+MERGE_CHUNK_QUERY = """
+MERGE (c:Chunk {chunkId: $chunk.chunkId})
+SET c.text = $chunk.text,
+    c.source = $chunk.source,
+    c.section = $chunk.section
+"""
+
+uploaded = 0
+for chunk in chunk_nodes:
+    exists = kg.query(
+        "MATCH (c:Chunk {chunkId: $chunkId}) RETURN count(c) > 0 AS exists",
+        params={"chunkId": chunk["chunkId"]}
+    )[0]["exists"]
+    if not exists:
+        kg.query(MERGE_CHUNK_QUERY, params={"chunk": chunk})
+        uploaded += 1
+print(f"Uploaded {uploaded} new chunks (skipped {len(chunk_nodes) - uploaded}).")
+
+# === Step 4: Create Vector Index ===
+kg.query("""
+CREATE VECTOR INDEX form_harvard_chunks IF NOT EXISTS
+FOR (c:Chunk) ON (c.textEmbedding)
+OPTIONS {
+  indexConfig: {
+    `vector.dimensions`: 1536,
+    `vector.similarity_function`: 'cosine'
+  }
+}
+""")
+print("Vector index created.")
+
+# === Step 5: Generate & Store Embeddings ===
+kg.query("""
+MATCH (c:Chunk)
+WHERE c.textEmbedding IS NULL
+WITH c, genai.vector.encode(
+  c.text,
+  "OpenAI",
+  {
+    token: $openAiApiKey
+  }
+) AS embedding
+CALL db.create.setNodeVectorProperty(c, "textEmbedding", embedding)
+RETURN count(*) AS updated
+""", params={"openAiApiKey": OPENAI_API_KEY})
+print("Embeddings generated and stored.")
+
+# === Step 6: Entity Extraction & MENTIONS Relationships ===
+nlp = spacy.load("en_core_web_sm")
+allowed_labels = {"PERSON": "Person", "ORG": "Organization", "GPE": "Place"}
+
+entity_map = {}
+chunk_entity_links = []
+
+for chunk in chunk_nodes:
+    doc = nlp(chunk["text"])
+    for ent in doc.ents:
+        if ent.label_ in allowed_labels:
+            label = allowed_labels[ent.label_]
+            key = ent.text.strip()
+            entity_map[key] = label
+            chunk_entity_links.append({
+                "chunkId": chunk["chunkId"],
+                "entityName": key,
+                "entityType": label
+            })
+
+print(f"Extracted {len(chunk_entity_links)} chunk-entity links.")
+print(f"Unique entities: {len(entity_map)}")
+
+# Create Entity nodes
+CREATE_ENTITY_QUERY = """
+MERGE (e:Entity {name: $name})
+ON CREATE SET e.type = $type
+"""
+for name, etype in entity_map.items():
+    kg.query(CREATE_ENTITY_QUERY, params={"name": name, "type": etype})
+
+# Create :MENTIONS relationships
+CREATE_RELATION_QUERY = """
+MATCH (c:Chunk {chunkId: $chunkId})
+MATCH (e:Entity {name: $entityName})
+MERGE (c)-[:MENTIONS]->(e)
+"""
+for link in chunk_entity_links:
+    kg.query(CREATE_RELATION_QUERY, params={
+        "chunkId": link["chunkId"],
+        "entityName": link["entityName"]
+    })
+
+print("Entities and MENTIONS relationships created.")
+
+# === Step 7: Interactive RAG Q&A + Markdown Logging ===
+retriever = Neo4jVector.from_existing_graph(
+    embedding=OpenAIEmbeddings(),
+    url=NEO4J_URI,
+    username=NEO4J_USERNAME,
+    password=NEO4J_PASSWORD,
+    index_name="form_harvard_chunks",
+    node_label="Chunk",
+    text_node_properties=["text"],
+    embedding_node_property="textEmbedding"
+).as_retriever()
+
+qa_chain = RetrievalQAWithSourcesChain.from_chain_type(
+    llm=ChatOpenAI(temperature=0),
+    chain_type="stuff",
+    retriever=retriever,
+    return_source_documents=True
+)
+
+print("\n Ask your questions below (type 'exit' to quit):")
+
+with open("rag_output.md", "w", encoding="utf-8") as log_file:
+    log_file.write("# RAG Results – Harvard University Knowledge Graph\n\n")
+
+    while True:
+        question = input("Ask a question: ").strip()
+        if question.lower() == "exit":
+            print("Exiting.")
+            break
+
+        response = qa_chain({"question": question})
+        answer = response["answer"]
+        sources = response["source_documents"]
+
+        print("\n Answer:\n", answer)
+        print("\n Sources:")
+        for doc in sources:
+            print("- " + doc.page_content[:300].replace("\n", " ") + "...\n" + "-" * 40)
+
+        # Log to Markdown
+        log_file.write(f"## Question: {question}\n")
+        log_file.write(f"**Answer:** {answer}\n\n")
+        log_file.write("**Sources:**\n")
+        for i, doc in enumerate(sources, 1):
+            snippet = doc.page_content[:300].replace("\n", " ") + "..."
+            log_file.write(f"{i}. {snippet}\n")
+        log_file.write("\n---\n\n")
